@@ -384,3 +384,4 @@ elif seccion == "📝 Reportes de estado":
                     except Exception as e:
                         st.error(f"No se pudo generar el archivo: {e}")
                 st.markdown('</div>', unsafe_allow_html=True)
+
