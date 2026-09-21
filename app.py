@@ -1,423 +1,219 @@
-"""
-Asistente Legal Online — v2
-Plataforma LegalTech: carga de expedientes en PDF, buscador de términos,
-asistente de consultas jurídicas (Q&A) y generador de escritos.
-Stack: Python 3.10+, Streamlit, pypdf, anthropic
-"""
-
 import streamlit as st
-from pypdf import PdfReader
-import io
-import re
-from datetime import datetime
+import os
+from google import genai
+from google.genai import types
+import pypdf
 
-try:
-    import anthropic
-except ImportError:
-    anthropic = None
-
-# ------------------------------------------------------------------
-# CONFIGURACIÓN GENERAL
-# ------------------------------------------------------------------
-
+# Configuración de la página (Diseño corporativo y formal)
 st.set_page_config(
-    page_title="Asistente Legal Online",
+    page_title="Asistente Legal Online | S.A.D.",
     page_icon="⚖️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-MODELO_IA = "claude-sonnet-5"          # Modelo Anthropic usado para Q&A y redacción
-MAX_CARACTERES_CONTEXTO = 12000        # Límite de texto del expediente enviado a la IA
-
-# ------------------------------------------------------------------
-# ESTILO CORPORATIVO (azul marino / gris, sin elementos default de Streamlit)
-# ------------------------------------------------------------------
-
-CSS = """
-<style>
-    #MainMenu, header, footer {visibility: hidden;}
-    .stDeployButton {display: none;}
-
-    .main { background-color: #eef1f5; }
-
-    :root {
-        --azul-marino: #0b2545;
-        --azul-medio: #13315c;
-        --gris-texto: #3c4a5c;
-        --gris-claro: #f4f6f8;
-        --borde: #d6dce3;
+# Estilos CSS personalizados para un look corporativo (Azul marino, grises, tipografía sobria)
+st.markdown("""
+    <style>
+    .main {
+        background-color: #f8f9fa;
     }
-
-    .header-app {
-        background-color: var(--azul-marino);
-        padding: 1.4rem 2rem;
-        border-radius: 10px;
-        margin-bottom: 1.5rem;
-    }
-    .header-app h1 {
-        color: white;
-        font-size: 1.7rem;
-        font-weight: 700;
-        margin: 0;
-    }
-    .header-app p {
-        color: #c3ccd8;
-        margin: 0.2rem 0 0 0;
-        font-size: 0.95rem;
-    }
-
-    .card {
-        background-color: white;
-        border: 1px solid var(--borde);
-        border-radius: 10px;
-        padding: 1.3rem 1.5rem;
-        margin-bottom: 1rem;
-    }
-
     .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
-        background-color: var(--gris-claro);
-        padding: 0.3rem;
-        border-radius: 8px;
+        gap: 10px;
     }
     .stTabs [data-baseweb="tab"] {
-        color: var(--gris-texto);
+        background-color: #e9ecef;
+        border-radius: 4px;
+        padding: 10px 20px;
         font-weight: 600;
-        border-radius: 6px;
-        padding: 0.5rem 1rem;
+        color: #495057;
     }
     .stTabs [aria-selected="true"] {
-        background-color: var(--azul-marino) !important;
+        background-color: #1d3557 !important;
         color: white !important;
     }
-
-    .stButton > button {
-        background-color: var(--azul-marino);
+    .stButton>button {
+        background-color: #1d3557;
         color: white;
-        border: none;
-        border-radius: 6px;
-        font-weight: 600;
-        padding: 0.5rem 1.2rem;
-    }
-    .stButton > button:hover {
-        background-color: var(--azul-medio);
-        color: white;
-    }
-
-    .resultado-busqueda {
-        background-color: var(--gris-claro);
-        border-left: 4px solid var(--azul-marino);
-        padding: 0.7rem 1rem;
-        margin-bottom: 0.6rem;
         border-radius: 4px;
-        font-size: 0.92rem;
-        color: var(--gris-texto);
+        font-weight: 600;
+        border: none;
     }
-    mark {
-        background-color: #ffd873;
-        padding: 0 2px;
-        border-radius: 2px;
-    }
-
-    .chat-usuario, .chat-asistente {
-        padding: 0.7rem 1rem;
-        border-radius: 8px;
-        margin-bottom: 0.6rem;
-        font-size: 0.95rem;
-    }
-    .chat-usuario {
-        background-color: var(--azul-marino);
+    .stButton>button:hover {
+        background-color: #457b9d;
         color: white;
-        margin-left: 15%;
     }
-    .chat-asistente {
-        background-color: var(--gris-claro);
-        color: var(--gris-texto);
-        border: 1px solid var(--borde);
-        margin-right: 15%;
+    h1, h2, h3 {
+        color: #1d3557;
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
     }
-</style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
+    .stAlert {
+        border-radius: 4px;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-# ------------------------------------------------------------------
-# ESTADO DE SESIÓN
-# ------------------------------------------------------------------
+# Verificación y carga segura de la API Key de Gemini desde los Secretos de Streamlit
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+else:
+    st.error("⚠️ Error de configuración: No se encontró la `GEMINI_API_KEY` en los secretos de Streamlit. Por favor, configúrala en el panel de control.")
+    st.stop()
 
-defaults = {
-    "texto_expediente": "",
-    "nombre_expediente": "",
-    "historial_chat": [],       # lista de {"rol": "usuario"/"asistente", "texto": str}
-    "ultimo_escrito": "",
-}
-for clave, valor in defaults.items():
-    if clave not in st.session_state:
-        st.session_state[clave] = valor
+# Inicializar el cliente oficial de Google GenAI
+client = genai.Client(api_key=api_key)
+# Usamos gemini-2.5-flash por su velocidad, gratuidad y enorme ventana de contexto para documentos largos
+MODEL_ID = 'gemini-2.5-flash'
 
+# Encabezado Corporativo
+st.markdown("# ⚖️ ASISTENTE LEGAL ONLINE")
+st.markdown("### Sistema Inteligente de Análisis y Gestión de Expedientes Judiciales")
+st.markdown("---")
 
-# ------------------------------------------------------------------
-# FUNCIONES AUXILIARES
-# ------------------------------------------------------------------
-
-def extraer_texto_pdf(archivo_subido) -> str:
-    """Extrae el texto completo de un PDF subido por el usuario."""
+# Función auxiliar para extraer texto de PDFs usando pypdf
+def extraer_texto_pdf(uploaded_file):
+    texto = ""
     try:
-        lector = PdfReader(io.BytesIO(archivo_subido.read()))
-        paginas = []
-        for i, pagina in enumerate(lector.pages):
-            texto_pagina = pagina.extract_text() or ""
-            paginas.append(f"\n--- Página {i + 1} ---\n{texto_pagina}")
-        return "".join(paginas).strip()
+        reader = pypdf.PdfReader(uploaded_file)
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                texto += t + "\n"
     except Exception as e:
-        st.error(f"No se pudo leer el PDF: {e}")
-        return ""
+        st.error(f"Error al leer el archivo PDF: {e}")
+    return texto
 
-
-def buscar_termino(texto: str, termino: str, contexto: int = 80) -> list:
-    """Devuelve una lista de fragmentos donde aparece el término buscado."""
-    if not texto or not termino:
-        return []
-    try:
-        resultados = []
-        patron = re.compile(re.escape(termino), re.IGNORECASE)
-        for coincidencia in patron.finditer(texto):
-            inicio = max(0, coincidencia.start() - contexto)
-            fin = min(len(texto), coincidencia.end() + contexto)
-            fragmento = texto[inicio:fin].replace("\n", " ")
-            fragmento_resaltado = patron.sub(lambda m: f"<mark>{m.group(0)}</mark>", fragmento)
-            resultados.append(fragmento_resaltado)
-        return resultados
-    except Exception as e:
-        st.error(f"Error al buscar el término: {e}")
-        return []
-
-
-def obtener_cliente_ia():
-    """
-    Crea el cliente de Anthropic leyendo la API key de forma interna y segura
-    desde st.secrets. El usuario final nunca ve ni ingresa esta clave: se
-    configura una única vez como "Secret" en Streamlit Community Cloud
-    (Settings → Secrets) con el formato ANTHROPIC_API_KEY = "sk-ant-...".
-    """
-    if anthropic is None:
-        st.error("La librería 'anthropic' no está instalada. Agregala a requirements.txt.")
-        return None
-    try:
-        clave = st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        st.error(
-            "No se encontró la API key en los secretos de la aplicación. "
-            "El administrador debe configurar ANTHROPIC_API_KEY en Settings → Secrets."
-        )
-        return None
-    try:
-        return anthropic.Anthropic(api_key=clave)
-    except Exception as e:
-        st.error(f"No se pudo inicializar el cliente de IA: {e}")
-        return None
-
-
-def consultar_ia(system_prompt: str, mensaje_usuario: str) -> str:
-    """Envía una consulta al modelo con el texto del expediente como contexto."""
-    cliente = obtener_cliente_ia()
-    if cliente is None:
-        return ""
-    try:
-        contexto = st.session_state.texto_expediente[:MAX_CARACTERES_CONTEXTO]
-        respuesta = cliente.messages.create(
-            model=MODELO_IA,
-            max_tokens=1500,
-            system=system_prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"EXPEDIENTE:\n{contexto}\n\nCONSULTA:\n{mensaje_usuario}",
-                }
-            ],
-        )
-        return respuesta.content[0].text
-    except Exception as e:
-        return f"Ocurrió un error al consultar la IA: {e}"
-
-
-# ------------------------------------------------------------------
-# ENCABEZADO
-# ------------------------------------------------------------------
-
-st.markdown(
-    """
-    <div class="header-app">
-        <h1>⚖️ Asistente Legal Online</h1>
-        <p>Plataforma de análisis de expedientes, consultas jurídicas y redacción asistida</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
+# Sidebar corporativa informativa
 with st.sidebar:
-    st.markdown("### Estado")
-    if st.session_state.nombre_expediente:
-        st.success(f"Expediente activo:\n**{st.session_state.nombre_expediente}**")
-        st.caption(f"{len(st.session_state.texto_expediente):,} caracteres extraídos")
-    else:
-        st.info("Todavía no cargaste ningún expediente.")
+    st.markdown("### 🏢 Panel de Control")
+    st.info("Estado del Sistema: **Conectado y Operativo**")
+    st.markdown("---")
+    st.markdown("**Módulos Activos:**")
+    st.markdown("✔️ Análisis Masivo de Fojas")
+    st.markdown("✔️ Consultas Inteligentes (Q&A)")
+    st.markdown("✔️ Generador de Escritos")
+    st.markdown("---")
+    st.caption("Uso exclusivo para profesionales del derecho. Desarrollado bajo altos estándares de seguridad y confidencialidad.")
 
-tab_carga, tab_buscador, tab_chat, tab_escritos = st.tabs(
-    ["📂 Expedientes", "🔍 Buscador", "💬 Asistente Jurídico", "📝 Generador de Escritos"]
-)
+# Contenedor principal de carga de documentos (Expediente)
+st.markdown("#### 📂 Carga de Expediente Judicial (Formato PDF)")
+uploaded_file = st.file_uploader("Seleccione o arrastre el archivo PDF completo del expediente", type=["pdf"])
 
+# Variables de sesión para retener el texto del expediente analizado
+if "expediente_texto" not in st.session_state:
+    st.session_state.expediente_texto = ""
 
-# ------------------------------------------------------------------
-# TAB 1: CARGA DE EXPEDIENTES
-# ------------------------------------------------------------------
+if uploaded_file is not None:
+    if not st.session_state.expediente_texto:
+        with st.spinner("Procesando y indexando el expediente completo por detrás..."):
+            st.session_state.expediente_texto = extraer_texto_pdf(uploaded_file)
+        st.success(f"¡Expediente cargado con éxito! ({len(uploaded_file.name)}) - Listo para operar.")
 
-with tab_carga:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("#### Cargar expediente judicial (PDF)")
-    st.caption("Admite expedientes extensos. La extracción puede tardar unos segundos según el tamaño.")
+# Si hay un expediente cargado, mostramos las pestañas de herramientas profesionales
+if st.session_state.expediente_texto:
+    
+    tab1, tab2, tab3 = st.tabs(["💬 Consultas al Expediente", "🔍 Buscador de Términos", "📝 Generador de Escritos"])
 
-    archivo = st.file_uploader("Seleccioná el archivo PDF", type=["pdf"])
+    # PESTAÑA 1: CHAT / CONSULTAS INTELIGENTES
+    with tab1:
+        st.markdown("### Asistente de Consultas Legales")
+        st.write("Realice preguntas en lenguaje natural sobre el contenido del expediente (ej: *¿Cuál fue el último movimiento?*, *¿Hay medidas cautelares vigentes?*, *¿Qué plazos procesales corren?*).")
 
-    if archivo is not None:
-        if st.button("Procesar expediente"):
-            with st.spinner("Extrayendo texto del expediente..."):
-                texto = extraer_texto_pdf(archivo)
-            if texto:
-                st.session_state.texto_expediente = texto
-                st.session_state.nombre_expediente = archivo.name
-                st.session_state.historial_chat = []
-                st.session_state.ultimo_escrito = ""
-                st.success(f"Expediente '{archivo.name}' procesado correctamente ({len(texto):,} caracteres).")
-            else:
-                st.error("No se pudo extraer texto del PDF. Puede ser un archivo escaneado sin OCR.")
+        # Historial de chat en memoria de sesión
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
-    if st.session_state.texto_expediente:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### Vista previa del texto extraído")
-        st.text_area(
-            "Contenido (solo lectura)",
-            value=st.session_state.texto_expediente[:5000] + (
-                "\n\n[...]" if len(st.session_state.texto_expediente) > 5000 else ""
-            ),
-            height=300,
-            disabled=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+        if user_query := st.chat_input("Escriba su consulta sobre el expediente..."):
+            st.session_state.messages.append({"role": "user", "content": user_query})
+            with st.chat_message("user"):
+                st.markdown(user_query)
 
+            with st.chat_message("assistant"):
+                with st.spinner("Analizando fojas del expediente..."):
+                    try:
+                        # Prompt de sistema estructurado para rol legal estricto
+                        prompt_completo = f"""
+                        Eres un asistente legal experto y meticuloso. Basándote exclusivamente en el siguiente texto de un expediente judicial, responde con precisión jurídica a la consulta del usuario. Si la información no se encuentra en el texto, indícalo claramente.
+                        
+                        --- TEXTO DEL EXPEDIENTE ---
+                        {st.session_state.expediente_texto[:150000]} 
+                        --- FIN DEL TEXTO ---
+                        
+                        Consulta del Profesional: {user_query}
+                        """
+                        response = client.models.generate_content(
+                            model=MODEL_ID,
+                            contents=prompt_completo,
+                        )
+                        respuesta_ia = response.text
+                        st.markdown(respuesta_ia)
+                        st.session_state.messages.append({"role": "assistant", "content": respuesta_ia})
+                    except Exception as e:
+                        st.error(f"Ocurrió un error al procesar la consulta con la IA: {e}")
 
-# ------------------------------------------------------------------
-# TAB 2: BUSCADOR DE TÉRMINOS
-# ------------------------------------------------------------------
+    # PESTAÑA 2: BUSCADOR DE TÉRMINOS
+    with tab2:
+        st.markdown("### Buscador Avanzado de Palabras Clave")
+        st.write("Filtra y localiza de forma instantánea menciones de términos específicos dentro de todo el expediente.")
+        
+        keyword = st.text_input("Ingrese palabra o concepto a buscar (ej: 'embargo', 'caducidad', 'testigo', 'cédula'):")
+        if keyword:
+            with st.spinner(f"Buscando '{keyword}' en el documento..."):
+                try:
+                    prompt_busqueda = f"""
+                    Busca en el siguiente texto del expediente todas las menciones relevantes relacionadas con la palabra clave: '{keyword}'. 
+                    Extrae los fragmentos o párrafos donde se mencione e indica en qué contexto o foja aproximada aparece si es posible.
+                    
+                    --- TEXTO DEL EXPEDIENTE ---
+                    {st.session_state.expediente_texto[:150000]}
+                    """
+                    response = client.models.generate_content(
+                        model=MODEL_ID,
+                        contents=prompt_busqueda,
+                    )
+                    st.markdown("#### Resultados de la Búsqueda:")
+                    st.markdown(response.text)
+                except Exception as e:
+                    st.error(f"Error en la búsqueda: {e}")
 
-with tab_buscador:
-    if not st.session_state.texto_expediente:
-        st.info("Cargá un expediente en la pestaña 'Expedientes' para poder buscar términos.")
-    else:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        termino = st.text_input("Buscar palabra o término dentro del expediente")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        if termino:
-            try:
-                resultados = buscar_termino(st.session_state.texto_expediente, termino)
-                if resultados:
-                    st.markdown(f"**{len(resultados)} coincidencia(s) encontrada(s):**")
-                    for fragmento in resultados:
-                        st.markdown(f'<div class="resultado-busqueda">…{fragmento}…</div>', unsafe_allow_html=True)
-                else:
-                    st.warning("No se encontraron coincidencias.")
-            except Exception as e:
-                st.error(f"Error al realizar la búsqueda: {e}")
-
-
-# ------------------------------------------------------------------
-# TAB 3: ASISTENTE DE CONSULTAS JURÍDICAS (CHAT / Q&A)
-# ------------------------------------------------------------------
-
-with tab_chat:
-    if not st.session_state.texto_expediente:
-        st.info("Cargá un expediente en la pestaña 'Expedientes' para consultar sobre su contenido.")
-    else:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### Consultá sobre el expediente cargado")
-        st.caption("Ejemplos: '¿Cuál fue el último movimiento?' · '¿Hay alguna medida cautelar vigente?' · '¿Qué plazos corren?'")
-
-        for turno in st.session_state.historial_chat:
-            clase = "chat-usuario" if turno["rol"] == "usuario" else "chat-asistente"
-            st.markdown(f'<div class="{clase}">{turno["texto"]}</div>', unsafe_allow_html=True)
-
-        pregunta = st.chat_input("Escribí tu consulta jurídica...")
-
-        if pregunta:
-            st.session_state.historial_chat.append({"rol": "usuario", "texto": pregunta})
-            system_prompt = (
-                "Sos un asistente jurídico que responde exclusivamente en base al contenido del "
-                "expediente proporcionado. Si la información no está en el expediente, indicalo "
-                "claramente en lugar de inventar datos. Respondé en español, de forma precisa y profesional."
-            )
-            with st.spinner("Analizando el expediente..."):
-                respuesta = consultar_ia(system_prompt, pregunta)
-            if respuesta:
-                st.session_state.historial_chat.append({"rol": "asistente", "texto": respuesta})
-            st.rerun()
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-# ------------------------------------------------------------------
-# TAB 4: GENERADOR AUTOMÁTICO DE ESCRITOS
-# ------------------------------------------------------------------
-
-with tab_escritos:
-    if not st.session_state.texto_expediente:
-        st.info("Cargá un expediente en la pestaña 'Expedientes' para generar borradores basados en su contenido.")
-    else:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### Generar borrador de escrito")
-
+    # PESTAÑA 3: GENERADOR AUTOMÁTICO DE ESCRITOS
+    with tab3:
+        st.markdown("### Generador Automático de Escritos Judiciales")
+        st.write("Seleccione el tipo de documento que necesita redactar a partir de los antecedentes y datos reales extraídos del expediente analizado.")
+        
         tipo_escrito = st.selectbox(
-            "Tipo de escrito",
-            [
-                "Contestación de demanda",
-                "Memorial",
-                "Escrito de estilo (presentación general)",
-                "Solicitud de medida cautelar",
-                "Recurso de apelación",
-            ],
+            "Seleccione el tipo de pieza procesal:",
+            ["Contestación de Demanda / Traslado", "Memorial de Agravios", "Escrito de mero trámite (Impulso procesal)", "Planteo de Prescripción / Caducidad"]
         )
-        instrucciones_extra = st.text_area(
-            "Instrucciones adicionales (opcional)",
-            placeholder="Ej: enfatizar la falta de legitimación pasiva, solicitar costas al vencido...",
-            height=100,
-        )
+        
+        instrucciones_extra = st.text_area("Instrucciones o directivas particulares para este escrito (opcional):", placeholder="Ej: Solicitar rechazo con costas, argumentar falta de legitimación...")
+        
+        if st.button("Generar Borrador del Escrito"):
+            with st.spinner("Redactando documento legal con rigor formal..."):
+                try:
+                    prompt_escrito = f"""
+                    Actúa como un abogado redactor senior. A partir de los datos y antecedentes del siguiente expediente judicial, redacta un borrador formal y completo para el siguiente documento: '{tipo_escrito}'.
+                    Instrucciones adicionales del letrado: {instrucciones_extra}
+                    
+                    Utiliza formato legal adecuado (Vistos y Consideradores si corresponde, petitorio formal, estilo jurídico sobrio y profesional).
+                    
+                    --- TEXTO DEL EXPEDIENTE ---
+                    {st.session_state.expediente_texto[:150000]}
+                    """
+                    response = client.models.generate_content(
+                        model=MODEL_ID,
+                        contents=prompt_escrito,
+                    )
+                    st.markdown("#### Borrador Generado:")
+                    st.markdown(response.text)
+                    st.success("Borrador generado con éxito. Puede copiar el texto para su revisión final y presentación.")
+                except Exception as e:
+                    st.error(f"Error al generar el escrito: {e}")
 
-        if st.button("Generar escrito"):
-            system_prompt = (
-                "Sos un abogado experto en redacción de escritos judiciales en Argentina. "
-                "A partir del expediente proporcionado, redactá un borrador profesional, "
-                "formal y bien estructurado del tipo de escrito solicitado. Usá lenguaje "
-                "jurídico apropiado, dejá indicado entre corchetes [ ] los datos que falten "
-                "o deban ser completados por el abogado. Respondé en español."
-            )
-            mensaje = f"Tipo de escrito solicitado: {tipo_escrito}.\nInstrucciones adicionales: {instrucciones_extra or 'ninguna'}."
-            with st.spinner("Redactando borrador..."):
-                borrador = consultar_ia(system_prompt, mensaje)
-            if borrador:
-                st.session_state.ultimo_escrito = borrador
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        if st.session_state.ultimo_escrito:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("#### Borrador generado")
-            st.text_area("Editá el texto si lo necesitás", value=st.session_state.ultimo_escrito, height=350, key="editor_escrito")
-            st.download_button(
-                "⬇️ Descargar borrador (.txt)",
-                data=st.session_state.editor_escrito,
-                file_name=f"borrador_{tipo_escrito.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.txt",
-                mime="text/plain",
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
+else:
+    st.warning("⚠️ Por favor, cargue un archivo PDF de expediente en la parte superior para habilitar el sistema de análisis inteligente y las herramientas de redacción.")
+                      
